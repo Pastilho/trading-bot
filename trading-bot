@@ -1,0 +1,188 @@
+.// core/trading-engine.js
+const { Connection, Keypair, Transaction, PublicKey } = require('@solana/web3.js');
+const { Liquidity, TokenAmount } = require('@raydium-io/raydium-sdk');
+const { Cluster, WhirlpoolContext } = require('@orca-so/whirlpool-client-sdk');
+const tf = require('@tensorflow/tfjs-node');
+const Redis = require('ioredis');
+const { KMS } = require('aws-sdk');
+const { sign } = require('@noble/ed25519');
+const Prometheus = require('prom-client');
+const { FinCEN } = require('fincen-compliance');
+
+class EnterpriseTradingBot {
+  constructor(config) {
+    this.config = {
+      rpcUrl: process.env.RPC_CLUSTER_URL,
+      redisCluster: process.env.REDIS_CLUSTER_URLS.split(','),
+      hsmConfig: {
+        kmsKeyId: process.env.AWS_KMS_KEY_ARN,
+        hsmSlot: process.env.HSM_SLOT_ID
+      },
+      ...config
+    };
+
+    this.initializeComponents();
+  }
+
+  async initializeComponents() {
+    // 1. Conexão Segura com Blockchain
+    this.connection = new Connection(this.config.rpcUrl, {
+      wsEndpoint: process.env.WS_ENDPOINT,
+      commitment: 'confirmed',
+      httpHeaders: {'x-api-key': process.env.RPC_API_KEY}
+    });
+
+    // 2. Cluster Redis para Estado Global
+    this.redis = new Redis.Cluster(this.config.redisCluster.map(url => ({
+      host: url.split(':')[0],
+      port: url.split(':')[1]
+    })));
+
+    // 3. Integração HSM para Gestão de Chaves
+    this.kms = new KMS({ region: 'us-east-1' });
+    this.hsmSession = await this.connectHSM();
+
+    // 4. Modelos de ML Pré-Treinados
+    this.models = await this.loadMLModels();
+
+    // 5. Monitoramento Avançado
+    this.metrics = this.setupMetrics();
+    collectDefaultMetrics({ register: Prometheus.register });
+  }
+
+  async connectHSM() {
+    const pkcs11 = require('pkcs11js');
+    const hsm = new pkcs11.PKCS11();
+    hsm.load(process.env.HSM_MODULE_PATH);
+    hsm.C_Initialize();
+    const slot = hsm.C_GetSlotList(true).find(s => s.slotDescription === this.config.hsmConfig.hsmSlot);
+    return hsm.C_OpenSession(slot, pkcs11.CKF_RW_SESSION | pkcs11.CKF_SERIAL_SESSION);
+  }
+
+  async loadMLModels() {
+    const models = {
+      pricePrediction: await tf.loadGraphModel('s3://trading-models/price-prediction/model.json'),
+      riskAssessment: await tf.loadGraphModel('s3://trading-models/risk-assessment/model.json')
+    };
+    return models;
+  }
+
+  setupMetrics() {
+    return {
+      tradeExecutionTime: new Prometheus.Histogram({
+        name: 'trade_execution_seconds',
+        help: 'Tempo total de execução de trades',
+        buckets: [0.1, 0.5, 1, 2, 5]
+      }),
+      slippage: new Prometheus.Gauge({
+        name: 'trade_slippage',
+        help: 'Slippage observado nos trades'
+      })
+    };
+  }
+
+  async executeSecureTrade(strategyConfig) {
+    const endTimer = this.metrics.tradeExecutionTime.startTimer();
+    try {
+      // 1. Verificação de Compliance
+      await FinCEN.verifyTrade(strategyConfig);
+
+      // 2. Cálculo de Parâmetros com ML
+      const prediction = await this.models.pricePrediction.predict(this.preprocessData(strategyConfig.marketData));
+      
+      // 3. Construção da Transação
+      const { transaction, signers } = await this.buildTransaction(strategyConfig);
+
+      // 4. Assinatura com HSM
+      const signedTx = await this.signWithHSM(transaction);
+
+      // 5. Execução com Tolerância a Falhas
+      const txId = await this.executeTransactionWithRetry(signedTx);
+
+      // 6. Atualização de Estado
+      await this.updateStateAfterTrade(txId, strategyConfig);
+
+      // 7. Logging e Monitoramento
+      this.logTradeExecution(txId, strategyConfig);
+      
+      return txId;
+    } catch (error) {
+      await this.handleCriticalError(error, strategyConfig);
+      throw error;
+    } finally {
+      endTimer();
+    }
+  }
+
+  async buildTransaction(config) {
+    // Implementação específica para cada DEX
+    switch(config.dexType) {
+      case 'RAYDIUM':
+        return this.buildRaydiumSwap(config);
+      case 'ORCA':
+        return this.buildOrcaSwap(config);
+      default:
+        throw new Error('DEX não suportada');
+    }
+  }
+
+  async buildRaydiumSwap({ inputToken, outputToken, amount }) {
+    const poolKeys = await Liquidity.fetchInfo({
+      connection: this.connection,
+      poolId: new PublicKey(process.env.RAYDIUM_POOL_ID)
+    });
+
+    const swapParams = {
+      poolKeys,
+      userKeys: {
+        tokenAccountIn: inputToken.account,
+        tokenAccountOut: outputToken.account,
+        owner: this.wallet.publicKey
+      },
+      amountIn: new TokenAmount(amount, inputToken.decimals),
+      fixedSide: 'in'
+    };
+
+    const { transactions } = await Liquidity.makeSwapTransaction({ ...swapParams, connection: this.connection });
+    return transactions[0];
+  }
+
+  async signWithHSM(transaction) {
+    const message = transaction.serializeMessage();
+    const { Signature: kmsSig } = await this.kms.sign({
+      KeyId: this.config.hsmConfig.kmsKeyId,
+      Message: message,
+      MessageType: 'DIGEST'
+    }).promise();
+
+    const hsmSig = await this.hsmSession.sign(message);
+    transaction.addSignature(this.wallet.publicKey, Buffer.concat([kmsSig, hsmSig]));
+    return transaction;
+  }
+
+  async executeTransactionWithRetry(transaction, retries = 3) {
+    for (let i = 0; i < retries; i++) {
+      try {
+        return await this.connection.sendTransaction(transaction);
+      } catch (error) {
+        if (i === retries - 1) throw error;
+        await new Promise(resolve => setTimeout(resolve, 100 * (i + 1)));
+      }
+    }
+  }
+
+  async updateStateAfterTrade(txId, config) {
+    await this.redis.multi()
+      .hincrby('portfolio', config.baseAsset, -config.amount)
+      .hincrby('portfolio', config.quoteAsset, config.expectedOutput)
+      .exec();
+  }
+
+  handleCriticalError(error, config) {
+    console.error([SEV1] Critical trading error:, error);
+    Prometheus.register.getSingleMetric('trading_errors_total').inc();
+    this.notifyIncidentResponseTeam(error, config);
+  }
+}
+
+module.exports = EnterpriseTradingBot;
